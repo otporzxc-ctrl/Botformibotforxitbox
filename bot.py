@@ -10,6 +10,17 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 TOKEN = os.environ["BOT_TOKEN"]
 BANNER = "/app/banner.mp4"
 
+# ✅ БЕЛЫЙ СПИСОК — добавь сюда Telegram ID нужных людей
+# Узнать свой ID: напиши @userinfobot в Telegram
+ALLOWED_USERS = set(map(int, os.environ.get("ALLOWED_USERS", "").split(","))) \
+    if os.environ.get("ALLOWED_USERS") else set()
+
+# Семафор — максимум 5 видео одновременно
+SEMAPHORE = asyncio.Semaphore(5)
+
+# Счётчик очереди
+queue_count = 0
+
 
 def get_video_info(path):
     result = subprocess.run([
@@ -18,8 +29,7 @@ def get_video_info(path):
         "-show_streams", path
     ], capture_output=True, text=True)
     data = json.loads(result.stdout)
-    info = {"duration": 0, "width": 1280, "height": 720,
-            "banner_w": 1350, "banner_h": 750}
+    info = {"duration": 0, "width": 1280, "height": 720}
     for s in data["streams"]:
         if s["codec_type"] == "video":
             info["duration"] = float(s.get("duration", 0))
@@ -29,9 +39,9 @@ def get_video_info(path):
 
 
 def get_insert_points(duration):
-    """По правилам CSDOG:
-    - до 60с → одна вставка в середине
-    - больше 60с → на 0:20, 1:20, 2:20 каждые 60с
+    """Правила CSDOG:
+    - до 60с → середина
+    - больше 60с → 0:20, 1:20, 2:20...
     """
     if duration <= 60:
         return [round(duration / 2, 2)]
@@ -45,10 +55,10 @@ def get_insert_points(duration):
 
 
 def calc_banner_size(width, height):
-    """Баннер 50% площади экрана по требованиям CSDOG"""
+    """50% площади экрана — требование CSDOG"""
     screen_area = width * height
     target_area = screen_area * 0.50
-    ratio = 1350 / 750  # размер баннера CSDOG
+    ratio = 1350 / 750
     bh = math.sqrt(target_area / ratio)
     bw = ratio * bh
     return int(bw), int(bh)
@@ -63,18 +73,12 @@ def process_video(input_path, output_path):
     if duration < 3:
         return False, "Видео слишком короткое"
 
-    points = get_insert_points(duration)
+    insert = get_insert_points(duration)[0]
+    insert_end = insert + 1.0
     bw, bh = calc_banner_size(W, H)
     bx = (W - bw) // 2
     by = (H - bh) // 2
-
-    banner_dur = 4.4  # длительность баннера CSDOG
-
-    # Строим сегменты: до точки → стоп+баннер → после
-    # Для простоты берём первую точку вставки
-    # (для длинных видео — первую на 0:20)
-    insert = points[0]
-    insert_end = insert + 1.0
+    banner_dur = 4.4
 
     filter_complex = f"""
         [0:v]split=3[v1][v2][v3];
@@ -104,8 +108,7 @@ def process_video(input_path, output_path):
         "-i", input_path,
         "-i", BANNER,
         "-filter_complex", filter_complex,
-        "-map", "[outv]",
-        "-map", "[outa]",
+        "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
@@ -114,75 +117,100 @@ def process_video(input_path, output_path):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        return False, result.stderr[-500:]
+        return False, result.stderr[-300:]
     return True, "ok"
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global queue_count
     msg = update.message
-    video = msg.video or msg.document
+    user_id = msg.from_user.id
 
+    # Проверка доступа
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await msg.reply_text("⛔ Нет доступа")
+        return
+
+    video = msg.video or msg.document
     if not video:
         await msg.reply_text("Скинь видео 🎬")
         return
 
-    if video.file_size and video.file_size > 50 * 1024 * 1024:
-        await msg.reply_text("❌ Видео слишком большое (макс 50MB)")
+    # Лимит 200MB
+    if video.file_size and video.file_size > 200 * 1024 * 1024:
+        await msg.reply_text("❌ Максимум 200MB")
         return
 
-    status = await msg.reply_text("⏳ Скачиваю видео...")
+    # Показываем позицию в очереди
+    queue_count += 1
+    pos = queue_count
+    status = await msg.reply_text(f"📥 В очереди #{pos}... Ожидай")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        input_path = os.path.join(tmp, "input.mp4")
-        output_path = os.path.join(tmp, "output.mp4")
+    async with SEMAPHORE:
+        await status.edit_text("⏳ Скачиваю видео...")
 
-        file = await context.bot.get_file(video.file_id)
-        await file.download_to_drive(input_path)
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = os.path.join(tmp, "input.mp4")
+            output_path = os.path.join(tmp, "output.mp4")
 
-        await status.edit_text("🎬 Вставляю баннер CSDOG...")
+            file = await context.bot.get_file(video.file_id)
+            await file.download_to_drive(input_path)
 
-        loop = asyncio.get_event_loop()
-        success, msg_text = await loop.run_in_executor(
-            None, process_video, input_path, output_path
-        )
+            await status.edit_text("🎬 Вставляю баннер CSDOG...")
 
-        if not success:
-            await status.edit_text(f"❌ Ошибка: {msg_text}")
-            return
-
-        await status.edit_text("📤 Отправляю готовое видео...")
-
-        with open(output_path, "rb") as f:
-            await msg.reply_video(
-                video=f,
-                caption=(
-                    "✅ Готово! Баннер CSDOG вставлен по правилам:\n"
-                    "• 50% экрана\n"
-                    "• Стоп-кадр + размытие\n"
-                    "• Звук баннера сохранён"
-                ),
-                supports_streaming=True
+            loop = asyncio.get_event_loop()
+            success, err = await loop.run_in_executor(
+                None, process_video, input_path, output_path
             )
 
-        await status.delete()
+            if not success:
+                await status.edit_text(f"❌ Ошибка: {err}")
+                queue_count -= 1
+                return
+
+            await status.edit_text("📤 Отправляю...")
+
+            with open(output_path, "rb") as f:
+                await msg.reply_video(
+                    video=f,
+                    caption="✅ Готово! Баннер CSDOG вставлен по правилам",
+                    supports_streaming=True
+                )
+
+            await status.delete()
+            queue_count -= 1
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Нет доступа")
+        return
     await update.message.reply_text(
-        "👋 Привет! Я бот для монетизации через CSDOG.\n\n"
-        "📌 Что делаю:\n"
-        "• Вставляю баннер CSDOG строго по правилам\n"
-        "• Видео до 1 мин → баннер в середине\n"
-        "• Видео больше 1 мин → на 0:20, 1:20, 2:20...\n"
+        "👋 Привет!\n\n"
+        "🎬 Скидывай видео — вставлю баннер CSDOG\n\n"
+        "📌 Правила вставки:\n"
+        "• До 1 мин → баннер в середине\n"
+        "• Больше 1 мин → на 0:20, 1:20, 2:20...\n"
         "• 50% экрана, стоп-кадр, звук сохранён\n\n"
-        "🎬 Просто скинь видео!"
+        "📦 Макс размер: 200MB\n"
+        "⚡ До 5 видео одновременно"
     )
+
+
+async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /id — узнать свой Telegram ID"""
+    uid = update.message.from_user.id
+    await update.message.reply_text(f"Твой Telegram ID: `{uid}`", parse_mode="Markdown")
 
 
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(r"^/start"), handle_start
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(r"^/id"), handle_id
     ))
     app.add_handler(MessageHandler(
         filters.VIDEO | filters.Document.VIDEO, handle_video
