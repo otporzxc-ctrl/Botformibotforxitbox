@@ -1,42 +1,46 @@
-# MusorDrop Bot
+# CSDOG Telegram Video Bot — Railway 512MB
 
-Телеграм бот — вставляет рекламный баннер MusorDrop в середину видео.
+Версия оптимизирована под Railway Free / 512 MB RAM.
 
-## Деплой на Railway
+## Главное изменение
 
-### 1. Подготовка файлов
-Положи в папку проекта:
+Старая версия запускала до 5 FFmpeg одновременно и использовала `split=3/asplit=2` внутри одного большого filter graph. Это очень легко выбивает 512 MB RAM.
+
+Новая версия:
+
+- максимум **1 FFmpeg одновременно**;
+- `split=3/asplit=2` убраны;
+- pre/post/freeze берутся отдельными входами исходного файла;
+- `threads=1`, `filter_threads=1`, `filter_complex_threads=1`;
+- stderr FFmpeg ограниченно хранится в памяти вместо `capture_output=True`;
+- после рендера проверяется наличие файла и его длительность;
+- реальный `returncode` и хвост stderr отправляются пользователю при ошибке;
+- временные файлы создаются через `TemporaryDirectory`.
+
+## Файлы
+
+В репозитории должны быть:
+
 - `bot.py`
 - `Dockerfile`
 - `requirements.txt`
-- `musordrop_animation_green-screen_sound_on.mp4` (переименуется в banner.mp4)
+- `musordrop_animation_green-screen_sound_on.mp4`
 
-### 2. Создай бота в Telegram
-1. Открой @BotFather в Telegram
-2. Напиши `/newbot`
-3. Придумай имя и юзернейм
-4. Скопируй токен (типа `7123456789:AAF...`)
+Баннер Dockerfile автоматически копирует в `/app/banner.mp4`.
 
-### 3. Залей на GitHub
-```
-git init
-git add .
-git commit -m "init"
-git branch -M main
-git remote add origin https://github.com/ТВОЙ_НИК/musordrop-bot.git
-git push -u origin main
-```
+## Railway Variables
 
-### 4. Railway
-1. Зайди на railway.app
-2. New Project → Deploy from GitHub
-3. Выбери репозиторий
-4. Variables → добавь: `BOT_TOKEN` = твой токен от BotFather
-5. Deploy → готово!
+Обязательно:
 
-## Как работает
-1. Скидываешь видео боту
-2. Бот находит середину
-3. Замораживает кадр + размывает фон
-4. Накладывает баннер (27% экрана, хрома-кей зелёного)
-5. Возвращает готовое видео
+`BOT_TOKEN=...`
+
+Опционально:
+
+`ALLOWED_USERS=123456789,987654321`
+`FFMPEG_TIMEOUT=600`
+
+## Почему не Cloudflare Workers
+
+Cloudflare Workers не является хорошей заменой для тяжёлого локального FFmpeg-рендера. Для этого бота проще оставить Python worker там, где доступна память и процессор.
+
+Если 512 MB всё равно окажется недостаточно для конкретных тяжёлых роликов, следующий шаг — вынести **только FFmpeg worker** на машину с 1–2 GB RAM, оставив Telegram-бота отдельно.
