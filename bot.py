@@ -143,114 +143,112 @@ def process_video(input_path, output_path):
         return False, "Не найден /app/banner.mp4"
 
     banner_duration = get_banner_duration()
-    if banner_duration <= 0:
-        return False, "Не удалось определить длительность banner.mp4"
-
     points = insert_points(duration, banner_duration)
     if not points:
         return False, "Для этого видео не помещается ни один баннер"
 
-    # Input logic:
-    # 9:16 (or close): fill 576x1024, crop only excess edges.
-    # 16:9 / landscape: preserve the whole source, put it over a blurred
-    # vertical background so there are no ugly black bars.
+    # IMPORTANT: every video branch gets its own normalization chain.
+    # Reusing one filter output in several trim filters can make FFmpeg connect
+    # one concat input to the ORIGINAL dimensions (e.g. 720x1280), which was the
+    # cause of returncode=234. We therefore split the raw input explicitly and
+    # normalize every branch independently before concat.
     aspect = info["width"] / max(info["height"], 1)
-    if aspect < 1.0:
-        base = (
-            f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
-            f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p"
-        )
-    else:
-        base = (
-            f"split=2[sharp][bg];"
-            f"[bg]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
-            f"crop={OUTPUT_W}:{OUTPUT_H},gblur=sigma=28,"
-            f"setsar=1,fps=30[bgv];"
-            f"[sharp]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
-            f"setsar=1,fps=30[fgv];"
-            f"[bgv][fgv]overlay=(W-w)/2:(H-h)/2,"
-            f"format=yuv420p"
-        )
+    branch_count = 2 * len(points) + 1
+    split_labels = [f"s{i}" for i in range(branch_count)]
 
-    # Build one segment per banner. The original video is frozen during each
-    # banner, while the banner video itself plays its COMPLETE animation.
+    if aspect < 1.0:
+        source_prefix = (
+            f"[0:v]split={branch_count}" + "".join(f"[{x}]" for x in split_labels) + ";"
+        )
+        def norm(label, out):
+            return (
+                f"[{label}]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+                f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p[{out}]"
+            )
+    else:
+        source_prefix = (
+            f"[0:v]split={branch_count}" + "".join(f"[{x}]" for x in split_labels) + ";"
+        )
+        def norm(label, out):
+            return (
+                f"[{label}]split=2[fg_{out}][bg_{out}];"
+                f"[bg_{out}]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+                f"crop={OUTPUT_W}:{OUTPUT_H},gblur=sigma=28,setsar=1,fps=30,format=yuv420p[bgv_{out}];"
+                f"[fg_{out}]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+                f"setsar=1,fps=30,format=yuv420p[fgv_{out}];"
+                f"[bgv_{out}][fgv_{out}]overlay=(W-w)/2:(H-h)/2:shortest=1,"
+                f"setsar=1,format=yuv420p[{out}]"
+            )
+
     v_parts = []
     a_parts = []
-
+    ordered_v = []
+    ordered_a = []
     cursor = 0.0
-    for i, point in enumerate(points):
-        # Main video before banner.
-        if point > cursor:
-            v_parts.append(
-                f"[src]trim=start={cursor}:end={point},setpts=PTS-STARTPTS[v{i}a]"
-            )
-            a_parts.append(
-                f"[0:a]atrim=start={cursor}:end={point},"
-                f"asetpts=PTS-STARTPTS,aresample=48000,"
-                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}a]"
-            )
+    branch_i = 0
 
-        # Freeze one exact frame from the source at the banner start.
-        freeze_idx = i + 100
+    for i, point in enumerate(points):
+        if point > cursor:
+            src_label = split_labels[branch_i]
+            branch_i += 1
+            vlabel = f"pre{i}"
+            v_parts.append(norm(src_label, f"rawpre{i}") + ";" +
+                           f"[rawpre{i}]trim=start={cursor}:end={point},setpts=PTS-STARTPTS,{'' if aspect < 1.0 else ''}format=yuv420p[{vlabel}]")
+            a_parts.append(
+                f"[0:a]atrim=start={cursor}:end={point},asetpts=PTS-STARTPTS,"
+                f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}]"
+            )
+            ordered_v.append(f"[{vlabel}]")
+            ordered_a.append(f"[a{i}]")
+
+        src_label = split_labels[branch_i]
+        branch_i += 1
+        rawfreeze = f"rawfreeze{i}"
+        freeze = f"freeze{i}"
         v_parts.append(
-            f"[src]trim=start={point}:end={point + 1/30},"
+            norm(src_label, rawfreeze) + ";" +
+            f"[{rawfreeze}]trim=start={point}:end={point + 1/30},"
             f"setpts=PTS-STARTPTS,select='eq(n,0)',"
             f"tpad=stop_mode=clone:stop_duration={banner_duration},"
-            f"trim=duration={banner_duration},setpts=PTS-STARTPTS[f{freeze_idx}]"
+            f"trim=duration={banner_duration},setpts=PTS-STARTPTS[{freeze}]"
         )
 
-        # IMPORTANT: no chromakey. The banner is inserted as a normal video,
-        # fully visible, maximized to the available 576px width and centered.
-        banner_idx = i + 200
+        ban = f"ban{i}"
+        ad = f"ad{i}"
         v_parts.append(
             f"[1:v]trim=duration={banner_duration},setpts=PTS-STARTPTS,"
             f"scale={OUTPUT_W}:-2:force_original_aspect_ratio=decrease,"
-            f"setsar=1,format=yuv420p[ban{banner_idx}]"
+            f"setsar=1,format=yuv420p[{ban}]"
         )
         v_parts.append(
-            f"[f{freeze_idx}][ban{banner_idx}]overlay="
-            f"x=(W-w)/2:y=(H-h)/2:shortest=1,format=yuv420p[ad{i}]"
+            f"[{freeze}][{ban}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+            f"setsar=1,format=yuv420p[{ad}]"
         )
-
         a_parts.append(
             f"[1:a]atrim=duration={banner_duration},asetpts=PTS-STARTPTS,"
-            f"aresample=48000,aformat=sample_fmts=fltp:"
-            f"sample_rates=48000:channel_layouts=stereo,"
+            f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
             f"volume=1.0[ba{i}]"
         )
+        ordered_v.append(f"[{ad}]")
+        ordered_a.append(f"[ba{i}]")
 
         cursor = point + banner_duration
 
-    # Tail of the original video.
     if cursor < duration:
-        tail_i = len(points) + 500
-        v_parts.append(
-            f"[src]trim=start={cursor},setpts=PTS-STARTPTS[tailv{tail_i}]"
-        )
+        src_label = split_labels[branch_i]
+        tail_raw = "tailraw"
+        tail = "tailv"
+        v_parts.append(norm(src_label, tail_raw) + ";" +
+                       f"[{tail_raw}]trim=start={cursor},setpts=PTS-STARTPTS[{tail}]")
         a_parts.append(
             f"[0:a]atrim=start={cursor},asetpts=PTS-STARTPTS,"
-            f"aresample=48000,aformat=sample_fmts=fltp:"
-            f"sample_rates=48000:channel_layouts=stereo[taila{tail_i}]"
+            f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[taila]"
         )
+        ordered_v.append(f"[{tail}]")
+        ordered_a.append("[taila]")
 
-    # Source normalization happens once before all cuts.
-    # For landscape input base creates a blurred vertical canvas with the
-    # complete 16:9 frame centered on it.
-    source_prefix = f"[0:v]{base}[src];"
-
-    # Concatenate video/audio in the exact same order.
-    ordered_v = []
-    ordered_a = []
-    for i in range(len(points)):
-        if i == 0:
-            pass
-        ordered_v.append(f"[v{i}a]")
-        ordered_a.append(f"[a{i}a]")
-        ordered_v.append(f"[ad{i}]")
-        ordered_a.append(f"[ba{i}]")
-    if cursor < duration:
-        ordered_v.append(f"[tailv{len(points)+500}]")
-        ordered_a.append(f"[taila{len(points)+500}]")
+    if branch_i != branch_count:
+        return False, f"Внутренняя ошибка ветвления видео: {branch_i}/{branch_count}"
 
     filters = (
         source_prefix
@@ -400,7 +398,7 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
-    print("✅ CSDOG bot v10 | Railway 512MB | FFmpeg concurrency=1")
+    print("✅ CSDOG bot v11 | Railway 512MB | FFmpeg concurrency=1")
     app.run_polling(drop_pending_updates=True)
 
 
