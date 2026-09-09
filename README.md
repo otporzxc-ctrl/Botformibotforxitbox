@@ -1,13 +1,3 @@
-# CSDOG Bot v12 FINAL
+# CSDOG Bot v13
 
-- 9:16 input -> fills 576x1024.
-- 16:9 input -> preserved on a blurred vertical background.
-- Complete banner animation, maximum width without cropping/distortion.
-- <=60s -> banner centered in timeline.
-- >60s -> 0:20, 1:20, 2:20... when the full banner fits.
-- Main video freezes during banner; banner audio is preserved.
-- Dynamic timeline; no fragile branch counter.
-- Duplicate Telegram updates ignored.
-- One FFmpeg render at a time for Railway 512MB.
-
-Put your own `banner.mp4` next to the Dockerfile before deployment.
+Final FFmpeg robustness fix: every individual video/freeze segment is explicitly normalized to exactly 576x1024, SAR 1:1, 30 FPS and yuv420p immediately before concat. Supports portrait and landscape inputs, full banner animation without chromakey, centered at maximum uncropped width. Long videos get banners at 0:20, 1:20, 2:20, etc. Railway concurrency is limited to one FFmpeg job.

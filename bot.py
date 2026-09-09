@@ -76,78 +76,102 @@ def process_video(inp, out):
     if d < 3: return False, "Видео слишком короткое"
     if not info["has_audio"]: return False, "В видео нет аудиодорожки"
     if not os.path.isfile(BANNER): return False, "Не найден /app/banner.mp4"
-    bd = banner_duration()
+
+    bd = min(banner_duration(), 4.4)
     points = points_for(d, bd)
     if not points: return False, "Баннер не помещается в это видео"
 
-    # First normalize the ORIGINAL video exactly once. Every later trim comes
-    # from this already-normalized stream, so concat can never receive 720x1280,
-    # 568x1280, odd SAR, or another source format.
+    # Никаких параллельных копий исходника. Сначала один нормализованный поток,
+    # затем split ровно по числу участков таймлайна. Каждая ветка используется один раз.
     if info["width"] < info["height"]:
-        source_norm = f"[0:v]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p[src];"
+        norm = (
+            f"[0:v]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p[src]"
+        )
     else:
-        source_norm = (
-            f"[0:v]split=2[fg0][bg0];"
-            f"[bg0]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,crop={OUTPUT_W}:{OUTPUT_H},gblur=sigma=28,setsar=1,fps=30,format=yuv420p[bg];"
-            f"[fg0]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,setsar=1,fps=30,format=yuv420p[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,fps=30,format=yuv420p[src];"
+        norm = (
+            f"[0:v]split=2[land_fg][land_bg];"
+            f"[land_bg]scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUTPUT_W}:{OUTPUT_H},gblur=sigma=24,setsar=1,fps=30,format=yuv420p[bg];"
+            f"[land_fg]scale={OUTPUT_W}:-2:force_original_aspect_ratio=decrease,"
+            f"setsar=1,fps=30,format=yuv420p[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,fps=30,format=yuv420p[src]"
         )
 
-    # Build exact timeline intervals. No branch counter, no 2/3 failure.
-    intervals = []
-    cursor = 0.0
+    intervals=[]
+    cursor=0.0
     for p in points:
-        if p > cursor + 0.001: intervals.append(("video", cursor, p))
-        intervals.append(("banner", p, min(p + bd, d)))
-        cursor = p + bd
-    if cursor < d - 0.001: intervals.append(("video", cursor, d))
+        if p > cursor + 0.001:
+            intervals.append(("video", cursor, p))
+        intervals.append(("banner", p, min(p+bd, d)))
+        cursor=p+bd
+    if cursor < d-0.001:
+        intervals.append(("video", cursor, d))
 
-    # Split normalized source into exactly the number of video intervals that need it.
-    n_video = sum(1 for x in intervals if x[0] == "video")
-    split_labels = [f"sv{i}" for i in range(n_video)]
-    if n_video == 1:
-        split_expr = f"[src]null[{split_labels[0]}];"
-    else:
-        split_expr = f"[src]split={n_video}" + "".join(f"[{x}]" for x in split_labels) + ";"
+    # КЛЮЧЕВОЙ ФИКС: источник split-ится ровно один раз и каждая ветка
+    # нормализуется перед concat. Для banner тоже берётся отдельная ветка,
+    # поэтому [src] нигде повторно не потребляется.
+    n=len(intervals)
+    labels=''.join(f'[s{i}]' for i in range(n))
+    split=f"[src]split={n}{labels}"
 
-    vparts, aparts = [], []
-    vi = 0
-    for i, (kind, start, end) in enumerate(intervals):
-        if kind == "video":
-            lab = f"v{i}"
-            vparts.append(f"[{split_labels[vi]}]trim=start={start}:end={end},setpts=PTS-STARTPTS[{lab}]")
-            aparts.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}]")
-            vi += 1
+    vf=[]
+    af=[]
+    ordered_v=[]
+    ordered_a=[]
+
+    for i,(kind,start,end) in enumerate(intervals):
+        dur=end-start
+        if kind=='video':
+            v=f'v{i}'; a=f'a{i}'
+            vf.append(
+                f"[s{i}]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
+                f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+                f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p[{v}]"
+            )
+            af.append(
+                f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
+                f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{a}]"
+            )
         else:
-            # Freeze one frame from the video immediately before the banner.
-            # The banner itself is scaled to maximum width while preserving all
-            # of its 1350x750 animation, so no part of it is cropped.
-            fv = f"freeze{i}"
-            av = f"ad{i}"
-            b = f"banner{i}"
-            vparts.append(
-                f"[src]trim=start={max(0,start-1/30)}:end={min(d,start+1/30)},setpts=PTS-STARTPTS,select='eq(n,0)',"
-                f"tpad=stop_mode=clone:stop_duration={end-start},trim=duration={end-start},setpts=PTS-STARTPTS[{fv}]"
+            fz=f'f{i}'; b=f'b{i}'; ad=f'ad{i}'; aa=f'aa{i}'
+            # Один кадр непосредственно перед баннером -> freeze на всю длину баннера.
+            vf.append(
+                f"[s{i}]trim=start={max(0,start-0.001):.6f}:end={min(d,start+0.05):.6f},"
+                f"select='eq(n,0)',setpts=PTS-STARTPTS,"
+                f"tpad=stop_mode=clone:stop_duration={dur:.6f},trim=duration={dur:.6f},"
+                f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+                f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30,format=yuv420p[{fz}];"
+                f"[1:v]trim=duration={dur:.6f},setpts=PTS-STARTPTS,"
+                f"scale={OUTPUT_W}:-2:force_original_aspect_ratio=decrease,"
+                f"setsar=1,fps=30,format=yuv420p[{b}];"
+                f"[{fz}][{b}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,"
+                f"setsar=1,fps=30,format=yuv420p[{ad}]"
             )
-            vparts.append(
-                f"[1:v]trim=duration={end-start},setpts=PTS-STARTPTS,"
-                f"scale={OUTPUT_W}:-2:force_original_aspect_ratio=decrease,setsar=1,format=yuv420p[{b}];"
-                f"[{fv}][{b}]overlay=x=(W-w)/2:y=(H-h)/2:shortest=1,setsar=1,fps=30,format=yuv420p[{av}]"
+            af.append(
+                f"[1:a]atrim=duration={dur:.6f},asetpts=PTS-STARTPTS,"
+                f"aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"volume=1.0[{aa}]"
             )
-            aparts.append(f"[1:a]atrim=duration={end-start},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=1.0[aa{i}]")
+        ordered_v.append(f"[{ad if kind=='banner' else v}]")
+        ordered_a.append(f"[{aa if kind=='banner' else a}]")
 
-    ordered_v = [f"[{('v' if kind=='video' else 'ad')}{i}]" for i,(kind,_,_) in enumerate(intervals)]
-    ordered_a = [f"[{('a' if kind=='video' else 'aa')}{i}]" for i,(kind,_,_) in enumerate(intervals)]
-    fc = source_norm + split_expr + ";".join(vparts) + ";" + ";".join(aparts) + ";" + "".join(ordered_v) + f"concat=n={len(intervals)}:v=1:a=0,settb=1/30[outv];" + "".join(ordered_a) + f"concat=n={len(intervals)}:v=0:a=1[outa]"
+    fc=(norm+';'+split+';'+';'.join(vf)+';'+
+        ''.join(ordered_v)+f"concat=n={n}:v=1:a=0,settb=AVTB,fps=30,format=yuv420p[outv];"+
+        ''.join(ordered_a)+f"concat=n={n}:v=0:a=1,aresample=48000[outa]")
 
-    cmd = ["ffmpeg","-hide_banner","-y","-threads","1","-filter_threads","1","-filter_complex_threads","1","-i",inp,"-stream_loop","-1","-i",BANNER,"-filter_complex",fc,"-map","[outv]","-map","[outa]","-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p","-r","30","-s","576x1024","-c:a","aac","-b:a","128k","-movflags","+faststart","-shortest",out]
-    rc, err = run_cmd(cmd)
-    if rc is None: return False, err
-    if rc != 0: return False, f"FFmpeg returncode={rc}\n{err}"
-    check = probe(out)
-    if not check or check["width"] != 576 or check["height"] != 1024 or not check["has_audio"]:
-        return False, "Результат не прошёл проверку 576x1024 + audio"
-    return True, "ok"
+    cmd=["ffmpeg","-hide_banner","-y","-threads","1","-filter_threads","1",
+         "-filter_complex_threads","1","-i",inp,"-stream_loop","-1","-i",BANNER,
+         "-filter_complex",fc,"-map","[outv]","-map","[outa]",
+         "-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p",
+         "-r","30","-c:a","aac","-b:a","128k","-movflags","+faststart","-shortest",out]
+    rc,err=run_cmd(cmd)
+    if rc is None: return False,err
+    if rc!=0: return False,f"FFmpeg returncode={rc}\n{err}"
+    check=probe(out)
+    if not check or check["width"]!=576 or check["height"]!=1024 or not check["has_audio"]:
+        return False,"Результат не прошёл проверку 576x1024 + audio"
+    return True,"ok"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
