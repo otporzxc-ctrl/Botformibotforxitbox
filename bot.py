@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import subprocess
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 TOKEN = os.environ["BOT_TOKEN"]
 BANNER = "/app/banner.mp4"
@@ -36,7 +36,6 @@ def get_video_info(path):
 
 
 def remux_video(input_path, output_path):
-    """Перекодируем входное видео в чистый mp4"""
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
@@ -71,7 +70,6 @@ def calc_banner_size(width, height):
 
 
 def process_video(input_path, output_path):
-    # Сначала перекодируем входное видео
     remuxed = input_path + "_remuxed.mp4"
     if not remux_video(input_path, remuxed):
         return False, "Не удалось декодировать видео"
@@ -85,7 +83,7 @@ def process_video(input_path, output_path):
     H = info["height"]
 
     if duration < 3:
-        return False, "Видео слишком короткое (меньше 3 секунд)"
+        return False, "Видео слишком короткое"
 
     insert = get_insert_points(duration)[0]
     insert_end = insert + 1.0
@@ -97,30 +95,20 @@ def process_video(input_path, output_path):
     filter_complex = f"""
         [0:v]split=3[v1][v2][v3];
         [0:a]asplit=2[a1][a2];
-
         [v1]trim=0:{insert},setpts=PTS-STARTPTS[part1v];
         [v3]trim={insert},setpts=PTS-STARTPTS[part2v];
-
         [a1]atrim=0:{insert},asetpts=PTS-STARTPTS[part1a];
         [a2]atrim={insert},asetpts=PTS-STARTPTS[part2a];
-
-        [v2]trim={insert}:{insert_end},setpts=PTS-STARTPTS,
-        select='eq(n,0)',gblur=sigma=20,
-        tpad=stop_mode=clone:stop_duration={banner_dur}[frozen];
-
-        [1:v]scale={bw}:{bh},
-        chromakey=color=00FF00:similarity=0.30:blend=0.05[banner_k];
-
+        [v2]trim={insert}:{insert_end},setpts=PTS-STARTPTS,select='eq(n,0)',gblur=sigma=20,tpad=stop_mode=clone:stop_duration={banner_dur}[frozen];
+        [1:v]scale={bw}:{bh},chromakey=color=00FF00:similarity=0.30:blend=0.05[banner_k];
         [frozen][banner_k]overlay=x={bx}:y={by}[ad_v];
-
         [part1v][ad_v][part2v]concat=n=3:v=1:a=0[outv];
         [part1a][1:a][part2a]concat=n=3:v=0:a=1[outa]
     """
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", remuxed,
-        "-i", BANNER,
+        "-i", remuxed, "-i", BANNER,
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "[outa]",
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
@@ -140,6 +128,27 @@ def process_video(input_path, output_path):
     return True, "ok"
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Нет доступа")
+        return
+    await update.message.reply_text(
+        "👋 Привет!\n\n"
+        "🎬 Скидывай видео — вставлю баннер CSDOG\n\n"
+        "📌 Правила:\n"
+        "• До 1 мин → баннер в середине\n"
+        "• Больше 1 мин → 0:20, 1:20, 2:20...\n"
+        "• 50% экрана, стоп-кадр, звук сохранён\n\n"
+        "📦 Макс: 50MB"
+    )
+
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.from_user.id
+    await update.message.reply_text(f"Твой Telegram ID: `{uid}`", parse_mode="Markdown")
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
@@ -150,7 +159,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     video = msg.video or msg.document
     if not video:
-        await msg.reply_text("Скинь видео 🎬")
         return
 
     if video.file_size and video.file_size > 50 * 1024 * 1024:
@@ -190,31 +198,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.delete()
 
 
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ Нет доступа")
-        return
-    await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "🎬 Скидывай видео — вставлю баннер CSDOG\n\n"
-        "📌 Правила:\n"
-        "• До 1 мин → баннер в середине\n"
-        "• Больше 1 мин → 0:20, 1:20, 2:20...\n"
-        "• 50% экрана, стоп-кадр, звук сохранён\n\n"
-        "📦 Макс: 50MB"
-    )
-
-
-async def handle_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    await update.message.reply_text(f"Твой Telegram ID: `{uid}`", parse_mode="Markdown")
-
-
 def main():
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/start"), handle_start))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/id"), handle_id))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     print("✅ Bot started")
     app.run_polling()
