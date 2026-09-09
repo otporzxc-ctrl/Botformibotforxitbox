@@ -1,49 +1,18 @@
-# CSDOG Telegram Video Bot — Railway 512 MB
+# CSDOG bot v9
 
-Бот на `python-telegram-bot 20.7` вставляет CSDOG-баннер в видео и подготавливает результат под TikTok 9:16 (`576x1024`).
+Railway 512 MB optimized Telegram bot.
 
-## Что исправлено
+- Output: 576x1024 TikTok/Reels
+- FFmpeg concurrency: 1
+- Banner: full 576px canvas width, centered vertically, source aspect ratio preserved
+- Video branches are independently normalized to 576x1024 / 30 FPS / SAR 1:1 before concat
+- `/id` is available independently of ALLOWED_USERS
+- `banner.mp4` must be present next to Dockerfile
 
-- Только **1 FFmpeg одновременно** — рассчитано на Railway с 512 MB RAM.
-- FFmpeg ограничен `threads=1`, `filter_threads=1`, `filter_complex_threads=1`.
-- Убрана тяжёлая схема `split=3/asplit=2`.
-- Баннер зацикливается через `-stream_loop -1`.
-- Баннер всегда помещается внутрь кадра и строго центрируется.
-- Исходное видео приводится к 576x1024 без чёрных полос.
-- Во время рекламы используется размытый стоп-кадр.
-- На время рекламы используется звук баннера; после рекламы исходный звук продолжается.
-- После рендера проверяются наличие video/audio и расхождение длительностей.
-- Ошибки FFmpeg теперь возвращаются с `returncode` и хвостом stderr.
-- `/id` доступен независимо от `ALLOWED_USERS`.
+## Deploy
 
-## Правила вставки
+Required Railway variable:
+- `BOT_TOKEN`
 
-- Видео до 60 секунд: баннер в середине.
-- Видео длиннее 60 секунд: первый баннер на 00:20.
-- Для роликов длиннее минуты при дальнейшем расширении логики можно добавлять точки 01:20, 02:20 и т. д.
-- Баннер — по центру кадра.
-- Озвучка баннера не отключается.
-
-## Файлы
-
-В репозитории должны быть:
-
-- `bot.py`
-- `Dockerfile`
-- `requirements.txt`
-- `banner.mp4` — оригинальная CSDOG-анимация с озвучкой и зелёным фоном.
-
-## Railway
-
-Переменные:
-
-```text
-BOT_TOKEN=токен_бота
-ALLOWED_USERS=123456789,987654321
-```
-
-`ALLOWED_USERS` можно оставить пустым для теста.
-
-## Важно про 512 MB
-
-Очередь намеренно однопоточная. Если пять пользователей отправят видео одновременно, четыре будут ждать завершения текущего FFmpeg. Это намного стабильнее, чем запускать пять кодировок параллельно на контейнере 512 MB.
+Optional:
+- `ALLOWED_USERS=123,456`

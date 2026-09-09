@@ -10,7 +10,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
-# Put the real CSDOG animation file next to the Dockerfile and name it banner.mp4.
 COPY banner.mp4 /app/banner.mp4
 
 CMD ["python", "bot.py"]

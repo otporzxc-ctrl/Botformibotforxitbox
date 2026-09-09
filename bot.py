@@ -12,7 +12,6 @@ BANNER = "/app/banner.mp4"
 
 ALLOWED_USERS = set(map(int, os.environ.get("ALLOWED_USERS", "").split(","))) \
     if os.environ.get("ALLOWED_USERS") else set()
-
 # Railway 512 MB: never run several heavy FFmpeg encodes at once.
 SEMAPHORE = asyncio.Semaphore(1)
 
@@ -57,7 +56,6 @@ def get_video_info(path):
         data = json.loads(result.stdout)
     except Exception:
         return None
-
     info = {"duration": 0.0, "width": 1280, "height": 720, "has_audio": False}
     for s in data.get("streams", []):
         if s.get("codec_type") == "video":
@@ -69,13 +67,11 @@ def get_video_info(path):
                 pass
         elif s.get("codec_type") == "audio":
             info["has_audio"] = True
-
     if not info["duration"]:
         try:
             info["duration"] = float(data.get("format", {}).get("duration") or 0)
         except (TypeError, ValueError):
             pass
-
     return info if info["duration"] > 0 else None
 
 
@@ -100,50 +96,46 @@ def process_video(input_path, output_path):
         return False, "Не найден /app/banner.mp4"
 
     insert = get_insert_point(duration)
-
-    # The old graph used split=3 and asplit=2. On a 512 MB Railway container
-    # that can keep several frame queues alive. We use one graph with one
-    # filter thread and normalize the final video to the required TikTok size.
-    #
-    # Banner is fitted INSIDE the 576x1024 canvas and is always centered.
-    # Its source aspect ratio is preserved, so it can never stick outside the
-    # left/right edges of the video.
-    banner_w = OUTPUT_W
-    banner_h = int(round(banner_w * 750 / 1350))  # 320px for 1350x750 source
-    banner_x = 0
-    banner_y = (OUTPUT_H - banner_h) // 2
-
-    # Make the source TikTok 9:16 without black bars: scale to cover + crop.
-    base = (
-        f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
-        f"crop={OUTPUT_W}:{OUTPUT_H},setsar=1,fps=30"
-    )
-
-    # Freeze exactly one source frame at insertion. The background is blurred,
-    # then the CSDOG banner is placed in the exact center of the TikTok canvas.
-    # The 4.4s ad replaces a 1s slice of the original and playback resumes from
-    # the frame immediately after that slice.
     ad_start = insert
     ad_end = min(insert + 1.0, duration)
 
+    # Every video branch is independently forced to the exact same final
+    # parameters before concat. This fixes failures on inputs such as 568x1280
+    # where concat otherwise sees different size/SAR values on one branch.
+    normalize = (
+        f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=increase,"
+        f"crop={OUTPUT_W}:{OUTPUT_H},"
+        "setsar=1,fps=30,format=yuv420p"
+    )
+
+    banner_w = OUTPUT_W
+    banner_h = 320  # 1350x750 banner fitted to full 576px width
+    banner_x = 0
+    banner_y = (OUTPUT_H - banner_h) // 2
+
     filter_complex = (
-        f"[0:v]{base},split=2[src][freeze];"
-        f"[src]trim=start=0:end={insert},setpts=PTS-STARTPTS[part1v];"
-        f"[src]trim=start={ad_end},setpts=PTS-STARTPTS[part2v];"
-        f"[freeze]trim=start={ad_start}:end={ad_end},setpts=PTS-STARTPTS,"
-        f"select='eq(n,0)',gblur=sigma=20,"
+        # Source is normalized once, then each concat branch is normalized again
+        # after trim. The repeated final normalization is intentional: it makes
+        # concat immune to odd source dimensions/SAR/frame-rate metadata.
+        f"[0:v]{normalize}[src];"
+        f"[src]trim=start=0:end={insert},setpts=PTS-STARTPTS,{normalize},settb=1/30[part1v];"
+        f"[src]trim=start={ad_end},setpts=PTS-STARTPTS,{normalize},settb=1/30[part2v];"
+        f"[src]trim=start={ad_start}:end={ad_end},setpts=PTS-STARTPTS,"
+        "select='eq(n,0)',gblur=sigma=20,"
         f"tpad=stop_mode=clone:stop_duration={BANNER_DURATION},"
-        f"trim=duration={BANNER_DURATION},setpts=PTS-STARTPTS[frozen];"
+        f"trim=duration={BANNER_DURATION},setpts=PTS-STARTPTS,{normalize},settb=1/30[frozen];"
         f"[1:v]scale={banner_w}:{banner_h}:force_original_aspect_ratio=decrease,"
         f"pad={banner_w}:{banner_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"chromakey=color=00FF00:similarity=0.30:blend=0.05[banner_k];"
-        f"[frozen][banner_k]overlay=x={banner_x}:y={banner_y}:shortest=0:repeatlast=0[ad_v];"
-        f"[part1v][ad_v][part2v]concat=n=3:v=1:a=0[outv];"
+        "setsar=1,format=yuv420p,"
+        "chromakey=color=00FF00:similarity=0.30:blend=0.05[banner_k];"
+        f"[frozen][banner_k]overlay=x={banner_x}:y={banner_y}:shortest=0:repeatlast=0,"
+        f"{normalize},settb=1/30[ad_v];"
+        "[part1v][ad_v][part2v]concat=n=3:v=1:a=0,settb=1/30[outv];"
         f"[0:a]atrim=start=0:end={insert},asetpts=PTS-STARTPTS[part1a];"
         f"[0:a]atrim=start={ad_end},asetpts=PTS-STARTPTS[part2a];"
         f"[1:a]atrim=duration={BANNER_DURATION},asetpts=PTS-STARTPTS,"
         f"volume=1.0,apad=pad_dur={BANNER_DURATION},atrim=duration={BANNER_DURATION}[bannera];"
-        f"[part1a][bannera][part2a]concat=n=3:v=0:a=1[outa]"
+        "[part1a][bannera][part2a]concat=n=3:v=0:a=1[outa]"
     )
 
     cmd = [
@@ -160,13 +152,14 @@ def process_video(input_path, output_path):
         "-preset", "ultrafast",
         "-crf", "30",
         "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-s", f"{OUTPUT_W}x{OUTPUT_H}",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
         "-shortest",
         output_path,
     ]
-
     returncode, stderr = run_cmd(cmd, timeout=600)
     if returncode is None:
         return False, stderr
@@ -176,11 +169,10 @@ def process_video(input_path, output_path):
     if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
         return False, "FFmpeg завершился, но выходной файл пустой/отсутствует"
 
-    # Post-render sanity check: video/audio must exist and durations should be close.
     check = subprocess.run(
         [
             "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_entries", "stream=codec_type,duration", output_path,
+            "-show_entries", "stream=codec_type,duration,width,height,sample_aspect_ratio", output_path,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -191,11 +183,15 @@ def process_video(input_path, output_path):
         streams = json.loads(check.stdout).get("streams", [])
         durations = {
             s.get("codec_type"): float(s.get("duration") or 0)
-            for s in streams
-            if s.get("codec_type") in ("video", "audio")
+            for s in streams if s.get("codec_type") in ("video", "audio")
         }
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
         if "video" not in durations or "audio" not in durations:
             return False, "После рендера отсутствует video или audio"
+        if not video or int(video.get("width") or 0) != OUTPUT_W or int(video.get("height") or 0) != OUTPUT_H:
+            return False, "После рендера размер видео не 576x1024"
+        if video.get("sample_aspect_ratio") not in ("1:1", "1:1"):
+            return False, f"После рендера SAR не 1:1: {video.get('sample_aspect_ratio')}"
         if abs(durations["video"] - durations["audio"]) > 0.5:
             return False, (
                 f"Длительности расходятся: video={durations['video']:.2f}s, "
@@ -203,7 +199,6 @@ def process_video(input_path, output_path):
             )
     except Exception as e:
         return False, f"Не удалось проверить результат: {e}"
-
     return True, "ok"
 
 
@@ -225,8 +220,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /id intentionally has NO ALLOWED_USERS restriction so the owner can
-    # retrieve an ID even before adding it to ALLOWED_USERS.
     uid = update.message.from_user.id
     await update.message.reply_text(f"Твой Telegram ID: {uid}")
 
@@ -234,7 +227,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     user_id = msg.from_user.id
-
     if ALLOWED_USERS and user_id not in ALLOWED_USERS:
         await msg.reply_text("⛔ Нет доступа")
         return
@@ -242,42 +234,32 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = msg.video or msg.document
     if not video:
         return
-
     if video.file_size and video.file_size > MAX_INPUT_MB * 1024 * 1024:
         await msg.reply_text(f"❌ Максимум {MAX_INPUT_MB}MB")
         return
 
     status = await msg.reply_text("⏳ Скачиваю...")
-
     async with SEMAPHORE:
         with tempfile.TemporaryDirectory(prefix="csdog_") as tmp:
             input_path = os.path.join(tmp, "input.mp4")
             output_path = os.path.join(tmp, "output.mp4")
-
             try:
                 file = await context.bot.get_file(video.file_id)
                 await file.download_to_drive(input_path)
             except Exception as e:
                 await status.edit_text(f"❌ Ошибка скачивания: {e}")
                 return
-
             await status.edit_text("🎬 Обрабатываю... (очередь: 1 видео за раз)")
-
             loop = asyncio.get_running_loop()
             try:
-                success, err = await loop.run_in_executor(
-                    None, process_video, input_path, output_path
-                )
+                success, err = await loop.run_in_executor(None, process_video, input_path, output_path)
             except Exception as e:
                 await status.edit_text(f"❌ Ошибка ffmpeg: {e}")
                 return
-
             if not success:
                 await status.edit_text(f"❌ Ошибка:\n{err[-3500:]}")
                 return
-
             await status.edit_text("📤 Отправляю...")
-
             try:
                 with open(output_path, "rb") as f:
                     await msg.reply_video(
@@ -294,10 +276,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(MessageHandler(
-        filters.VIDEO | filters.Document.VIDEO, handle_video
-    ))
-    print("✅ Bot started | Railway 512MB mode | FFmpeg concurrency=1")
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+    print("✅ Bot started | Railway 512MB mode | FFmpeg concurrency=1 | v9")
     app.run_polling()
 
 
