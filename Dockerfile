@@ -8,6 +8,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
-COPY CSDOG_MP4_MAN.mp4 banner.mp4
+COPY banner.mp4 banner.mp4
 
 CMD ["python", "bot.py"]
