@@ -134,7 +134,7 @@ def prepare_input(input_path, tmp, info):
 
     cmd += [
         "-r", "30",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
@@ -149,8 +149,10 @@ def prepare_input(input_path, tmp, info):
 
 def extract_segment(source, start, end, out_path):
     """
-    Вырезаем сегмент. Используем -ss после -i для точного кута (медленнее, но точнее).
-    Всегда перекодируем чтобы не было глюков на стыках.
+    Вырезаем сегмент.
+    -ss ПЕРЕД -i = быстрый seek к ближайшему keyframe.
+    Перекодирование (-c:v libx264) всё равно происходит, поэтому
+    итоговая точность достаточная, а скорость — максимальная.
     """
     duration = round(end - start, 6)
     if duration <= 0:
@@ -158,11 +160,10 @@ def extract_segment(source, start, end, out_path):
 
     cmd = [
         "ffmpeg", "-y",
+        "-ss", str(start),   # быстрый seek ДО -i
         "-i", source,
-        "-ss", str(start),
         "-t", str(duration),
-        # Перекодируем для единообразия
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
@@ -211,7 +212,7 @@ def make_banner_segment(source, freeze_at, out_path):
         "-map", "[outv]",
         "-map", "1:a",          # аудио ТОЛЬКО от баннера
         "-t", str(BANNER_DURATION),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
@@ -421,7 +422,7 @@ def main():
         filters.VIDEO | filters.Document.VIDEO, handle_video
     ))
     print("✅ Bot started")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
