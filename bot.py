@@ -1,5 +1,4 @@
 import os
-import math
 import json
 import asyncio
 import tempfile
@@ -16,12 +15,20 @@ ALLOWED_USERS = set(map(int, os.environ.get("ALLOWED_USERS", "").split(","))) \
 # Только 1 видео одновременно — 512MB RAM
 SEMAPHORE = asyncio.Semaphore(1)
 
-BANNER_DURATION = 4.4
-MAX_VIDEO_DURATION = 120  # 2 минуты
+BANNER_DURATION = 4.4        # точная длительность баннера
+MAX_VIDEO_DURATION = 120     # 2 минуты
+TARGET_W = 576
+TARGET_H = 1024
+
+# Размер баннера на экране: на всю ширину
+BANNER_W = TARGET_W
+BANNER_H = int(TARGET_W * 750 / 1350)  # 576 * (750/1350) = 320
+BANNER_X = 0
+BANNER_Y = (TARGET_H - BANNER_H) // 2  # по центру по вертикали
 
 
-def run_ffmpeg(cmd):
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+def run_ffmpeg(cmd, timeout=600):
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return result.returncode == 0, result.stderr
 
 
@@ -35,15 +42,16 @@ def get_video_info(path):
     ], capture_output=True, text=True)
     try:
         data = json.loads(result.stdout)
-    except:
+    except Exception:
         return None
 
     info = {"duration": 0, "width": 1280, "height": 720, "has_audio": False}
-
     for s in data.get("streams", []):
         if s["codec_type"] == "video":
-            info["duration"] = float(s.get("duration", 0) or
-                                     data.get("format", {}).get("duration", 0))
+            dur = float(s.get("duration") or 0)
+            if dur == 0:
+                dur = float(data.get("format", {}).get("duration", 0))
+            info["duration"] = dur
             info["width"] = int(s.get("width", 1280))
             info["height"] = int(s.get("height", 720))
         elif s["codec_type"] == "audio":
@@ -55,8 +63,11 @@ def get_video_info(path):
     return info if info["duration"] > 0 else None
 
 
-def get_insert_points(duration):
-    """Точки вставки баннера по правилам CSDOG"""
+def get_insert_point(duration):
+    """
+    Одна точка вставки — ровно середина видео.
+    Для видео > 60 сек можно добавить несколько, но пока одна.
+    """
     if duration <= 60:
         return [round(duration / 2, 3)]
     else:
@@ -68,59 +79,67 @@ def get_insert_points(duration):
         return points
 
 
-def check_duration(path):
-    """Проверяем длительность результата"""
-    info = get_video_info(path)
-    if not info:
-        return 0
-    return info["duration"]
-
-
 def prepare_input(input_path, tmp, info):
     """
-    Приводим входное видео к формату 576x1024:
-    - вертикальное → scale+crop
-    - горизонтальное → размытый фон + оригинал по центру
+    Приводим входное видео к формату 576x1024 30fps AAC.
+    Горизонтальное → размытый фон + оригинал по центру.
+    Вертикальное   → scale+crop.
+    Выходной файл всегда имеет аудиодорожку (тишина если нет звука).
     """
     W, H = info["width"], info["height"]
     prepared = os.path.join(tmp, "prepared.mp4")
     is_vertical = H >= W
 
     if is_vertical:
-        vf = "scale=576:1024:force_original_aspect_ratio=increase,crop=576:1024"
-    else:
-        # Горизонтальное: размытый фон + оригинал по центру
-        # Вписываем оригинал в ширину 576
-        orig_h = int(576 * H / W)
-        orig_y = (1024 - orig_h) // 2
         vf = (
-            f"split=2[bg][fg];"
-            f"[bg]scale=576:1024:force_original_aspect_ratio=increase,"
-            f"crop=576:1024,gblur=sigma=30[blurred];"
-            f"[fg]scale=576:{orig_h}[orig];"
-            f"[blurred][orig]overlay=x=0:y={orig_y}"
+            f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
+            f"crop={TARGET_W}:{TARGET_H}"
         )
-
-    if is_vertical:
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-vf", vf,
-            "-r", "30",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            prepared
-        ]
+        video_filter_arg = ["-vf", vf]
     else:
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-filter_complex", vf,
-            "-r", "30",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            prepared
-        ]
+        orig_h = int(TARGET_W * H / W)
+        if orig_h % 2 != 0:
+            orig_h -= 1
+        orig_y = (TARGET_H - orig_h) // 2
+        filter_complex = (
+            f"[0:v]split=2[bg][fg];"
+            f"[bg]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
+            f"crop={TARGET_W}:{TARGET_H},gblur=sigma=30[blurred];"
+            f"[fg]scale={TARGET_W}:{orig_h}[orig];"
+            f"[blurred][orig]overlay=x=0:y={orig_y}[outv]"
+        )
+        video_filter_arg = ["-filter_complex", filter_complex, "-map", "[outv]"]
+
+    # Базовые аргументы
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    cmd += video_filter_arg
+
+    # Аудио: если есть — перекодируем, нет — генерируем тишину
+    if info["has_audio"] and is_vertical:
+        cmd += ["-map", "0:a"]
+    elif info["has_audio"] and not is_vertical:
+        cmd += ["-map", "0:a"]
+    else:
+        # Генерируем тишину нужной длины
+        cmd = ["ffmpeg", "-y", "-i", input_path,
+               "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        cmd += video_filter_arg if is_vertical else ["-filter_complex",
+            (f"[0:v]split=2[bg][fg];"
+             f"[bg]scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
+             f"crop={TARGET_W}:{TARGET_H},gblur=sigma=30[blurred];"
+             f"[fg]scale={TARGET_W}:{int(TARGET_W * H / W) - (int(TARGET_W * H / W) % 2)}[orig];"
+             f"[blurred][orig]overlay=x=0:y={(TARGET_H - (int(TARGET_W * H / W) - (int(TARGET_W * H / W) % 2))) // 2}[outv]"),
+            "-map", "[outv]"]
+        cmd += ["-map", "1:a", "-shortest"]
+
+    cmd += [
+        "-r", "30",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart",
+        prepared
+    ]
 
     ok, err = run_ffmpeg(cmd)
     if not ok:
@@ -128,56 +147,75 @@ def prepare_input(input_path, tmp, info):
     return prepared, None
 
 
-def extract_segment(source, start, end, out_path, has_audio=True):
-    """Вырезаем сегмент видео"""
-    duration = round(end - start, 3)
+def extract_segment(source, start, end, out_path):
+    """
+    Вырезаем сегмент. Используем -ss после -i для точного кута (медленнее, но точнее).
+    Всегда перекодируем чтобы не было глюков на стыках.
+    """
+    duration = round(end - start, 6)
+    if duration <= 0:
+        return False, f"Нулевой сегмент: start={start} end={end}"
+
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start),
         "-i", source,
+        "-ss", str(start),
         "-t", str(duration),
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        # Перекодируем для единообразия
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
         "-r", "30",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+        out_path
     ]
-    if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    else:
-        cmd += ["-an"]
-    cmd += ["-movflags", "+faststart", out_path]
     return run_ffmpeg(cmd)
 
 
-def make_freeze_with_banner(source, freeze_at, out_path, W=576, H=1024):
+def make_banner_segment(source, freeze_at, out_path):
     """
-    Делаем стоп-кадр + баннер поверх:
-    - замораживаем кадр на freeze_at
-    - накладываем banner с хрома-кеем
+    Создаём сегмент с баннером:
+    1. Замораживаем кадр на freeze_at (стоп-кадр)
+    2. Накладываем баннер с хрома-кеем поверх
+    3. Аудио = только звук баннера (оригинальное аудио заглушается)
+    
+    Выход: ровно BANNER_DURATION секунд.
     """
-    bw = 576
-    bh = int(576 / (1350 / 750))  # ~320px
-    bx = (W - bw) // 2
-    by = (H - bh) // 2
+    bw = BANNER_W
+    bh = BANNER_H
+    bx = BANNER_X
+    by = BANNER_Y
 
+    # Берём один кадр на freeze_at и растягиваем его на BANNER_DURATION
+    # Баннер накладываем поверх с хрома-кеем
     filter_complex = (
-        f"[0:v]trim={freeze_at}:{freeze_at+0.1},setpts=PTS-STARTPTS,"
-        f"select='eq(n\\,0)',"
-        f"tpad=stop_mode=clone:stop_duration={BANNER_DURATION}[frozen];"
-        f"[1:v]scale={bw}:{bh},"
-        f"chromakey=color=00FF00:similarity=0.30:blend=0.05[banner_k];"
-        f"[frozen][banner_k]overlay=x={bx}:y={by}[outv]"
+        # Стоп-кадр: берём один кадр, дублируем на всю длину баннера
+        f"[0:v]trim=start={freeze_at}:duration=0.1,"
+        f"setpts=PTS-STARTPTS,"
+        f"loop=loop=-1:size=1:start=0,"
+        f"trim=duration={BANNER_DURATION},"
+        f"setpts=PTS-STARTPTS[frozen];"
+        # Баннер: масштабируем и убираем хрома-кей
+        f"[1:v]scale={bw}:{bh}[banner_scaled];"
+        f"[banner_scaled]chromakey=color=0x00FF00:similarity=0.25:blend=0.0[banner_key];"
+        # Накладываем баннер на стоп-кадр
+        f"[frozen][banner_key]overlay=x={bx}:y={by}[outv]"
     )
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", source,
-        "-i", BANNER,
+        "-i", source,           # 0: подготовленное видео (для стоп-кадра)
+        "-i", BANNER,           # 1: баннер
         "-filter_complex", filter_complex,
         "-map", "[outv]",
-        "-map", "1:a",
+        "-map", "1:a",          # аудио ТОЛЬКО от баннера
         "-t", str(BANNER_DURATION),
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
         "-r", "30",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         out_path
     ]
@@ -185,7 +223,10 @@ def make_freeze_with_banner(source, freeze_at, out_path, W=576, H=1024):
 
 
 def concat_segments(segments, out_path):
-    """Склеиваем сегменты через concat demuxer"""
+    """
+    Склейка через concat demuxer.
+    Все сегменты уже в одинаковом формате (libx264, 30fps, aac 48k).
+    """
     list_file = out_path + "_list.txt"
     with open(list_file, "w") as f:
         for seg in segments:
@@ -196,84 +237,90 @@ def concat_segments(segments, out_path):
         "-f", "concat",
         "-safe", "0",
         "-i", list_file,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-r", "30",
-        "-c:a", "aac", "-b:a", "128k",
+        # Копируем потоки — они уже одинаковые, перекодировать не нужно
+        "-c", "copy",
         "-movflags", "+faststart",
         out_path
     ]
     ok, err = run_ffmpeg(cmd)
     try:
         os.remove(list_file)
-    except:
+    except Exception:
         pass
     return ok, err
 
 
 def process_video(input_path, output_path):
     with tempfile.TemporaryDirectory() as tmp:
-        # 1. Получаем инфо
+        # 1. Получаем инфо об оригинале
         info = get_video_info(input_path)
         if not info:
             return False, "Не удалось прочитать видео"
 
         duration = info["duration"]
-
         if duration < 3:
             return False, "Видео слишком короткое (меньше 3 секунд)"
-
         if duration > MAX_VIDEO_DURATION:
-            return False, f"Видео слишком длинное. Максимум 2 минуты"
+            return False, "Видео слишком длинное. Максимум 2 минуты"
 
-        # 2. Приводим к 576x1024
+        # 2. Приводим к 576x1024 30fps
         prepared, err = prepare_input(input_path, tmp, info)
         if not prepared:
-            return False, f"Ошибка подготовки: {err[-200:]}"
+            return False, f"Ошибка подготовки: {err[-300:]}"
 
-        # 3. Точки вставки
-        points = get_insert_points(duration)
-        banner_count = len(points)
+        # 3. Получаем реальную длительность подготовленного видео
+        prepared_info = get_video_info(prepared)
+        if not prepared_info:
+            return False, "Не удалось прочитать подготовленное видео"
+        prepared_duration = prepared_info["duration"]
 
-        # 4. Нарезаем сегменты и вставляем баннеры
+        # 4. Точки вставки баннера (по prepared_duration)
+        points = get_insert_point(prepared_duration)
+
+        # 5. Нарезаем сегменты
         segments = []
         prev = 0.0
 
         for i, pt in enumerate(points):
-            # Сегмент до баннера
+            # Сегмент ДО баннера
             seg_path = os.path.join(tmp, f"seg_{i}.mp4")
             ok, err = extract_segment(prepared, prev, pt, seg_path)
             if not ok:
-                return False, f"Ошибка сегмента {i}: {err[-200:]}"
+                return False, f"Ошибка вырезки сегмента {i}: {err[-300:]}"
             segments.append(seg_path)
 
-            # Баннер (стоп-кадр + баннер)
+            # Баннерный сегмент (стоп-кадр + баннер поверх)
             ban_path = os.path.join(tmp, f"ban_{i}.mp4")
-            ok, err = make_freeze_with_banner(prepared, pt, ban_path)
+            ok, err = make_banner_segment(prepared, pt, ban_path)
             if not ok:
-                return False, f"Ошибка баннера {i}: {err[-200:]}"
+                return False, f"Ошибка баннера {i}: {err[-300:]}"
             segments.append(ban_path)
 
             prev = pt
 
-        # Последний сегмент после всех баннеров
-        last_path = os.path.join(tmp, f"seg_last.mp4")
-        ok, err = extract_segment(prepared, prev, duration, last_path)
+        # Финальный сегмент после последнего баннера
+        last_path = os.path.join(tmp, "seg_last.mp4")
+        ok, err = extract_segment(prepared, prev, prepared_duration, last_path)
         if not ok:
-            return False, f"Ошибка последнего сегмента: {err[-200:]}"
+            return False, f"Ошибка финального сегмента: {err[-300:]}"
         segments.append(last_path)
 
-        # 5. Склеиваем всё
+        # 6. Склеиваем всё
         ok, err = concat_segments(segments, output_path)
         if not ok:
-            return False, f"Ошибка склейки: {err[-200:]}"
+            return False, f"Ошибка склейки: {err[-300:]}"
 
-        # 6. Проверяем длительность
-        result_duration = check_duration(output_path)
-        expected = round(duration + BANNER_DURATION * banner_count, 1)
-        if abs(result_duration - expected) > 2.0:
+        # 7. Проверка результата
+        result_info = get_video_info(output_path)
+        if not result_info:
+            return False, "Результирующий файл повреждён"
+
+        expected = round(prepared_duration + BANNER_DURATION * len(points), 1)
+        got = result_info["duration"]
+        if abs(got - expected) > 2.0:
             return False, (
-                f"Ошибка длительности: ожидалось ~{expected}с, "
-                f"получилось {result_duration:.1f}с"
+                f"Некорректная длительность: ожидалось ~{expected:.1f}с, "
+                f"получилось {got:.1f}с"
             )
 
         return True, "ok"
@@ -289,9 +336,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Что делаю:\n"
         "• 9:16 → вертикальный кадр\n"
         "• 16:9 → целиком на размытом фоне\n"
-        "• Баннер CSDOG целиком, максимально широкий\n"
-        "• До 1 мин → баннер по центру\n"
-        "• Длиннее → 0:20, 1:20, 2:20...\n"
+        "• Баннер CSDOG на всю ширину, по центру\n"
+        "• До 1 мин → баннер посередине\n"
+        "• Длиннее → каждые 60 сек с 0:20\n"
         "• Аудио баннера сохраняется\n\n"
         "📦 Макс: 50MB, 2 минуты"
     )
@@ -349,13 +396,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.edit_text(f"❌ Ошибка: {err}")
                 return
 
-            if not os.path.exists(output_path) or \
-               os.path.getsize(output_path) == 0:
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 await status.edit_text("❌ Файл не создался")
                 return
 
             await status.edit_text("📤 Отправляю...")
-
             try:
                 with open(output_path, "rb") as f:
                     await msg.reply_video(
