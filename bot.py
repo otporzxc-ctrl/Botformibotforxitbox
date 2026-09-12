@@ -176,51 +176,54 @@ def extract_segment(source, start, end, out_path):
 
 def make_banner_segment(source, freeze_at, out_path):
     """
-    Создаём сегмент с баннером:
-    1. Замораживаем кадр на freeze_at (стоп-кадр)
-    2. Накладываем баннер с хрома-кеем поверх
-    3. Аудио = только звук баннера (оригинальное аудио заглушается)
-    
-    Выход: ровно BANNER_DURATION секунд.
+    1. Вытаскиваем один кадр на freeze_at -> PNG
+    2. PNG как зацикленный фон на BANNER_DURATION сек
+    3. Накладываем баннер с хромакеем поверх
+    4. Аудио только от баннера
     """
-    bw = BANNER_W
-    bh = BANNER_H
-    bx = BANNER_X
-    by = BANNER_Y
+    frame_path = out_path + "_frame.png"
 
-    # Берём один кадр на freeze_at и растягиваем его на BANNER_DURATION
-    # Баннер накладываем поверх с хрома-кеем
+    # Шаг 1: один кадр в PNG
+    cmd_frame = [
+        "ffmpeg", "-y",
+        "-ss", str(freeze_at),
+        "-i", source,
+        "-vframes", "1",
+        frame_path
+    ]
+    ok, err = run_ffmpeg(cmd_frame)
+    if not ok:
+        return False, f"Не удалось вытащить кадр: {err[-200:]}"
+
+    # Шаг 2: PNG + баннер -> финальный сегмент
     filter_complex = (
-        # Стоп-кадр: берём один кадр, дублируем на всю длину баннера
-        f"[0:v]trim=start={freeze_at}:duration=0.1,"
-        f"setpts=PTS-STARTPTS,"
-        f"loop=loop=-1:size=1:start=0,"
-        f"trim=duration={BANNER_DURATION},"
-        f"setpts=PTS-STARTPTS[frozen];"
-        # Баннер: масштабируем и убираем хрома-кей
-        f"[1:v]scale={bw}:{bh}[banner_scaled];"
-        f"[banner_scaled]chromakey=color=0x00FF00:similarity=0.25:blend=0.0[banner_key];"
-        # Накладываем баннер на стоп-кадр
-        f"[frozen][banner_key]overlay=x={bx}:y={by}[outv]"
+        f"[0:v]scale={TARGET_W}:{TARGET_H},setsar=1[bg];"
+        f"[1:v]scale={BANNER_W}:{BANNER_H},"
+        f"chromakey=color=0x00FF00:similarity=0.25:blend=0.0[ck];"
+        f"[bg][ck]overlay=x={BANNER_X}:y={BANNER_Y}[outv]"
     )
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", source,           # 0: подготовленное видео (для стоп-кадра)
-        "-i", BANNER,           # 1: баннер
+        "-loop", "1", "-i", frame_path,
+        "-i", BANNER,
         "-filter_complex", filter_complex,
         "-map", "[outv]",
-        "-map", "1:a",          # аудио ТОЛЬКО от баннера
+        "-map", "1:a",
         "-t", str(BANNER_DURATION),
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
-        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         out_path
     ]
-    return run_ffmpeg(cmd)
+    ok, err = run_ffmpeg(cmd)
+    try:
+        os.remove(frame_path)
+    except Exception:
+        pass
+    return ok, err
 
 
 def concat_segments(segments, out_path):
